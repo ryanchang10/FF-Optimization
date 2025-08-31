@@ -1,0 +1,35 @@
+---
+title: "FF Draft Optimization"
+output: html_document
+date: "2024-09-01"
+---
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(readr)
+library(ggthemes)
+library(rvest)
+library(tidyr)
+library(purrr)
+library(polite)
+library(tidytext)
+library(plotly)
+library(stringr)
+library(shiny)
+library(ggfittext)
+library(car)
+library(lmtest)
+library(sandwich)
+library(janitor)
+library(GGally)
+library(tidymodels)
+```
+
+
+
+```{r}
+espn_data <- read_csv("2024-2025 FF ESPN PROJECTIONS.csv")
+```
+

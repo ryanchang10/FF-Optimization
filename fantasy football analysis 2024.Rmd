@@ -1,0 +1,709 @@
+---
+title: "Fantasy Football Analysis"
+author: 'Ryan Chang'
+output: html_document
+date: "2024-08-19"
+---
+
+```{r setup include = FALSE}
+library(tidyverse)
+library(ggplot2)
+library(readr)
+library(ggthemes)
+library(rvest)
+library(tidyr)
+library(purrr)
+library(polite)
+library(tidytext)
+library(plotly)
+library(stringr)
+library(shiny)
+library(ggfittext)
+library(car)
+library(lmtest)
+library(sandwich)
+library(janitor)
+library(GGally)
+library(tidymodels)
+```
+
+```{r}
+# Web scrape the fantasy data from the past 6 years, from Pro Football Reference
+# Add a year column to the data
+url1 <- "https://www.pro-football-reference.com/years/"
+url2 <- "/fantasy.htm"
+
+index <- seq(2018, 2023, 1)
+df_new <- list()
+
+for (i in 1:length(index)){
+  full_url <- str_glue({url1}, {str_glue({index[i]},{url2})})
+  webpage <- read_html(full_url)
+  table_new <- html_table(webpage)[[1]] %>% 
+    janitor::clean_names() %>% 
+    mutate(across(everything(), as.character))
+  table_new['year'] <- as.character(index[i])
+  
+  df_new[[i]] <- table_new
+}
+
+full_data1 <- bind_rows(df_new)
+```
+
+```{r}
+
+# Clean up the dataset: renaming columns, cleaning up player names column, adding a total percent games played column. 
+new_colnames <- c('rank', 'player', 'team', 'position', 'age', 'games', 'games_started', 'cmp', 'pass_att', 'p_yds', 'ptds', 'int', 'rush_att', 'rush_yds', 'y_per_rush', 'rush_td', 'tgt', 'rec', 'rec_yds', 'y_per_rec', 'rec_tds', 'fmb', 'fumb_lost', 'tot_td','2pm', '2pp', 'fantpt', 'ppr', 'dkpt', 'fdpt', 'vbd', 'pos_rank', 'ovr_rank', 'year')
+
+full_data2 <- full_data1 %>%
+  filter(!grepl("Player", x_2)) %>% 
+  rename_with(~ new_colnames, all_of(colnames(full_data1))) %>% 
+  mutate(across(5:34, as.numeric)) %>% 
+  mutate(pct_games_played = ifelse(year %in% list(2018, 2019, 2020), (games / 16), (games / 17))) %>% 
+  group_by(year)
+
+
+# Clean the player names column by removing special characters
+full_data2$player <- gsub("[[:punct:]]", "", full_data2$player)
+```
+
+
+```{r}
+# Filter past datasets by position, add a column for difference from average
+
+qb_data <- full_data2 %>% 
+  filter(position == "QB")
+
+avg_qb_fantpt <- (sapply(qb_data, mean))['fantpt']
+
+qb_data <- qb_data %>% 
+  mutate(comp_pct = cmp/pass_att) %>% 
+  mutate(yds_per_pass = p_yds/cmp) %>% 
+  mutate(tds_per_game = ptds/games) %>% 
+  mutate(tds_per_int = ptds/int) %>%
+  mutate(ryds_per_game = rush_yds / games)
+
+
+# RB DATA
+rb_data <- full_data2 %>% 
+  filter(position == "RB" | position == "FB") %>% 
+  filter(fantpt != "NA")
+
+# store the average fantasy points for a runningback
+avg_rb_fantpt <- (sapply(rb_data, mean))['fantpt']
+
+rb_data_min <- rb_data %>% 
+  filter(rush_att > 8) %>% 
+  mutate(avg_diff = fantpt - avg_rb_fantpt) %>% 
+  mutate(tds_per_rush = rush_td/rush_att) %>% 
+  mutate(pct_rec = rec/(rush_att + rec)) %>% 
+  mutate(pct_caught = rec/tgt)
+
+# WR DATA
+wr_data <- full_data2 %>% 
+  filter(position == "WR") %>% 
+  filter(fantpt != 'NA') %>% 
+  mutate(rectds_per_game = rec_tds/games)
+
+avg_wr_fantpt <- (sapply(full_data2 %>% filter(position == 'WR') %>% filter(fantpt != 'NA'), mean))['fantpt']
+
+wr_data <- wr_data %>% 
+  mutate(avg_diff = fantpt - avg_wr_fantpt)
+
+
+# TE DATA
+te_data <- full_data2 %>% 
+  filter(position == "TE") %>% 
+  filter(fantpt != 'NA') %>% 
+  mutate(rtds_per_game = rec_tds/games)
+
+avg_te_fantpt <- (sapply(te_data, mean))['fantpt']
+
+te_data <- te_data %>% 
+  mutate(avg_diff = fantpt- avg_te_fantpt)
+```
+
+
+```{r}
+# EDA on all QB Data
+
+# Relationship between age and fantasy points, by year
+ggplot(qb_data, aes(x = age, y = fantpt, color = as.factor(year))) + 
+  geom_point() +
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() +
+  labs(x = "Age", y = "Fantasy Points", title = "Age vs. Fantasy Points of QBs per Year", color = "Year")
+
+# Trends from the above plot:
+# Most years have a positive relationship between age and fantasy points. The higher the age of the quarterback, the higher the fantasy points. There were some years where this relationship was more positive than others. However, in 2023, this relationship was substantially negative compared to the other years. While there was only one year of this pattern, it was the most recent year, which might be indicating a shift towards younger QB with less experience. QB's like Brady, Roethlisberger, Ryan might have been skewing data towards older quarterbacks. 
+
+
+# Relationship between age and fantasy points, by year, for the top 20 QBs per year in terms of fantasy points
+ggplot((qb_data %>% arrange(desc(fantpt)) %>% group_by(year) %>% slice(1:20)), aes(x = age, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() +
+  labs(x = "Age", y = "Fantasy Points", title = "Age vs. Fantasy Points for the Top 20 QBs per Year, in Terms of Fantasy Points", color = "Year")
+
+# Trends from the above plot: 
+# Now you can clearly see that most years have a negative relationship between age and fantasy points, with an exception in 2021 (relationship is slightly positive), and 2018 (relationship is ever so slightly negative). 4/6 of the most recent years showed this trend. 
+
+# Conclusion: A younger aged QB tends to result in higher fantasy point totals, and will likely be an important contributor of fantasy points.
+
+
+# Relationship between percent games played and fantasy points (I expect pretty clear trends here)
+ggplot(qb_data, aes(x = pct_games_played, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Age", y = "Fantasy Points", title = "Age vs. Fantasy Points of QBs per Year", color = "Year")
+
+# Trends from above plot: 
+# Obviously, the more games played, the more fantasy points you score. This graph might seem trivial, but it acts as an introduction to some deeper thinking. I want to pinpoint which QBs have the most games played in the last few years. If they've played every game of the last 5 years, they are likely to be less of an injury risk and play most of the games in the upcoming season. One interesting note here is the Bills and Bengals didn't play all 17 games in 2022, due to the cancellation of the Demar Hamlin Game. Stars like Josh Allen, or Joe Burrow will show as not having played 'all' the games in this year (both played in 16 of 16 games that were officially scored and recorded). Whether this will affect overall analysis and points remains unclear at this point. 
+
+
+# Relationship between tds per int and fantasy points
+ggplot(qb_data, aes(x = tds_per_int, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = 'Touchdowns per Interception thrown', y = 'Fantasy Points', title = "Touchdowns per Interceptions Thrown vs. Fantasy Points of QBs per Year")
+
+# Trends of above plot
+# As touchdowns and interceptions are direct contributors of fantasy point gains and losses, predicted that these would have a strong linear relationship. I want to use a graph like this in the future to grab the top tds/int players, and use those players in my decisions for the draft. 
+
+
+
+# Relationship between completion percentage and fantasy points
+ggplot(qb_data, aes(x = comp_pct, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Completion Percentage", y = 'Fantasy Points', title = 'Completion Percentage vs. Fantasy Points of QBs per Year')
+
+# Trends of above plot
+# Initially, I see lots of positive linear relationships. Just looking at the graph, though, I can tell there are some 'problems' with this visualization. First, there are outliers skewing the regression lines. Some QBs have very high or very low completion percentages that pull the lines down. These, I'm assuming, are QBs with very low pass attempts. I want to look at QBs with a minimum of 150 pass attempts-based on NFL averages, this would be approximately playing 5 games (pass attempt data roughly taken from https://www.teamrankings.com/nfl/stat/pass-attempts-per-game). 
+
+# creating new test dataset for this visualization
+qb_data_min <- qb_data %>% 
+  filter(pass_att > 150)
+
+# Re-creating the above graph
+ggplot(qb_data_min, aes(x = comp_pct, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Completion Percentage", y = 'Fantasy Points', title = 'Completion Percentage vs. Fantasy Points of QBs per Year')
+
+# Trends from above graph
+# All QBs from the last 5 years with a minimum of 150 pass attempts have between a 50% and a 75% completion percentage. Within these bounds, there is a strong positive correlation between Comp. Pct. and fantasy points. I foresee this being a large contributor to fant pts in a regression
+
+
+
+# Relationship between yards per pass and fantasy points
+ggplot(qb_data_min, aes(x = yds_per_pass, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Yards per Pass", y = 'Fantasy Points', title = 'Yards per Pass vs. Fantasy Points of QBs per Year')
+
+
+# Trends from above graph
+# This graph was a little tough to read due to outliers once again. There are a few points with insanely high yards per pass and very low fantasy points. Again, this is likely a player who attempted only a couple passes and they happened to be very long completions. I will graph again using the filter for quarterbacks with over 150 pass attempts
+
+
+
+# Relationship between yards per pass and fantasy points for QBs above 150 pass attempts
+ggplot(qb_data_min, aes(x = yds_per_pass, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Yards per Pass", y = 'Fantasy Points', title = 'Yards per Pass vs. Fantasy Points of QBs per Year')
+
+# Trends from above graph
+# Another positive relationship. Excited to see the strength of this relationship in a regression. 
+
+
+
+# Relationship between yards per rush and fantasy points
+ggplot(qb_data_min, aes(x = y_per_rush, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Yards per Rush", y = 'Fantasy Points', title = 'Yards per Rush vs. Fantasy Points of QBs per Year')
+
+# Trends from above plot
+# Very minimally positive relationship between yards per rush and fantasy points. In 2019, there was one player with a very high yards per rush and a very high fantasy point total. 
+
+
+# Relationship between rush yards per game and fantasy points
+ggplot(qb_data_min, aes(x = ryds_per_game, y = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  theme_minimal() + 
+  labs(x = "Rush Yards per Game", y = 'Fantasy Points', title = 'Rush yards per Game vs. Fantasy Points of QBs per Year')
+```
+
+
+
+```{r}
+# First regression model, using the dataset with QBs that have a minimum of 150 pass attempts. 
+qb_model <- lm(fantpt ~ comp_pct + ptds + int + yds_per_pass + tds_per_game + tds_per_int + ryds_per_game + y_per_rush + yds_per_pass * tds_per_game + comp_pct * yds_per_pass + comp_pct * tds_per_game, data = qb_data_min)
+summary(qb_model)
+ggpairs(qb_data_min, columns = 35:41)
+
+# checking for normality in the residuals to maintain unbiased estimators
+ggplot(qb_data_min, aes(x = qb_model$residuals)) + 
+  geom_histogram() + 
+  labs(title = 'Checking Normality in Residuals for Unbiased Estimators', x = 'Residuals')
+# This histogram looks relatively normal. There is nothing from this graph to suggest that the residuals are not normally distributed. 
+
+# Checking QQ plot
+ggplot(qb_data_min, aes(sample = qb_model$residuals)) + 
+  geom_qq() + 
+  geom_qq_line() + 
+  labs(y = 'Sample Quantiles', x = 'Theoretical Normal Quantiles', title = 'QQ Plot')
+# This QQ plot generally suggest normality. There are trends at the tails where the sample quantiles are above the normal like. From about -1.5 to 1.5, the points stick very closely to the normal line. Overall, this plot doesn't worry me too much about violating normality, but I do want to note the trend for the points outside of -2 and 2 Theoretical Quantiles.
+
+# Shapiro Wilks test for normality
+shapiro.test(qb_model$residuals)
+# The test statistic for this test based on this model is high, and the p-value lies just within our significance level. We fail to reject the null hypothesis that the residuals of this model are not normally distributed, allowing us to proceed assuming unbiased and efficient predictors (minimum variance, and expected value = true value).
+```
+
+
+```{r}
+# Web scrape 2024-2025 season predictions via fantasypros.com
+
+url3 <- "https://www.fantasypros.com/nfl/projections/"
+url4 <- ".php?week=draft"
+
+index2 <- c("qb", "rb", "wr", 'te', 'k', 'dst')
+
+
+for (i in 1:length(index2)){
+  full_url2 <- str_glue({url3}, {str_glue({index2[i]},{url4})})
+  webpage2<- read_html(full_url2)
+  table_new2 <- html_table(webpage2)[[1]] %>% 
+    janitor::clean_names() %>% 
+    mutate(across(everything(), as.character)) %>% 
+    mutate(position = index2[i])
+  
+  df_pred[[i]] <- table_new2
+}
+
+
+# Data processing, cleaning, adding columns of metrics I'm interested in exploring
+# Creating a dataset of the predictions for each position, processing and cleaning data for each one separately. 
+# QB prediction dataset
+qb_pred <- df_pred[[1]] %>% 
+  rename_with(~c('player', 'patt', 'pcmp', 'pyds', 'ptds', 'int', 'ratt', 'ryds', 'rtds', 'fl', 'fantpt', 'position')) %>% 
+  slice(-c(1,2)) %>% 
+  mutate(player = str_replace(player, "\\s[^ ]+$", "")) %>% 
+  mutate(player = ifelse(player == "Patrick Mahomes II", 'Patrick Mahomes', player)) %>% 
+  mutate(player = ifelse(player == "Gardner Minshew II", 'Gardner Minshew', player)) %>% 
+  mutate(games = 17) %>% 
+  mutate_at("pyds", str_replace, ',', '') %>%
+  mutate_at(c(2:11), as.double) %>%
+  mutate(comp_pct = pcmp/patt) %>%
+  mutate(yds_per_pass = pyds/pcmp) %>%
+  mutate(tds_per_game = ptds/games) %>%
+  mutate(tds_per_int = ptds/int) %>%
+  mutate(ryds_per_game = ryds/games) %>% 
+  mutate(pct_games_played = 100) %>% 
+  mutate(y_per_rush = ryds/ratt) %>% 
+  filter(patt > 150)
+
+
+# Running back prediction dataset
+rb_pred <- df_pred[[2]] %>% 
+  rename_with(~c('player', 'rush_att', 'rush_yds', 'rush_td', 'rec', 'recyds', 'rec_tds', 'fl', 'fantpt', 'position')) %>% 
+  slice(-c(1,2)) %>% 
+  mutate(player = str_replace(player, "\\s[^ ]+$", "")) %>% 
+  mutate(games = 17) %>% 
+  mutate_at("rush_yds", str_replace, ',', '') %>%
+  mutate_at(c(2:9), as.numeric) %>% 
+  mutate(y_per_rush = rush_yds/rush_att) %>% 
+  mutate(y_per_rec = recyds/rec) %>% 
+  mutate(fmb = 2) %>% # defaulting the fumble prediction to be 2 
+  mutate(tds_per_rush = rush_td/rush_att) %>% 
+  mutate(pct_rec = rec / (rec + rush_att))
+
+
+# Wide receiver prediction dataset
+wr_pred <- df_pred[[3]] %>% 
+  rename_with(~c('player', 'rec', 'rec_yds', 'rec_tds', 'rush_att', 'rush_yds', 'rush_td', 'fl', 'fantpt', 'position')) %>% 
+  slice(-c(1,2)) %>% 
+  mutate(player = str_replace(player, "\\s[^ ]+$", "")) %>% 
+  mutate(games = 17) %>% 
+  mutate_at("rec_yds", str_replace, ',', '') %>%
+  mutate_at(c(2:9), as.numeric) %>% 
+  mutate(y_per_rec = rec_yds/rec) %>% 
+  mutate(rectds_per_game = rec_tds/games) %>% 
+  mutate(fmb = 1) #defaulting the fumble prediction to be 1
+
+
+# Tight end prediction dataset
+te_pred <- df_pred[[4]] %>% 
+  rename_with(~c('player', 'rec', 'rec_yds', 'rec_tds', 'fl', 'fantpt', 'position')) %>% 
+  slice(-c(1,2)) %>% 
+  mutate(player = str_replace(player, "\\s[^ ]+$", "")) %>% 
+  mutate_at("rec_yds", str_replace, ',', '') %>%
+  mutate(games = 17) %>% 
+  mutate_at(c(2:6), as.numeric) %>% 
+  mutate(rtds_per_game = rec_tds/games) %>% 
+  mutate(y_per_rec = rec_yds/rec)
+
+
+# While this prediction data included predictions for kickers and defense/special teams, I didn't model predictions for those as the past data I was using didn't include these positions. 
+# For my drafts, I picked based on my personal preferences and thoughts, rather than based on statistics. 
+# Kickers prediction dataset
+k_pred <- df_pred[[5]] %>% 
+  mutate(player = str_replace(player, "\\s[^ ]+$", "")) %>% 
+  mutate(games = 17) %>% 
+  mutate_at(c(2:5), as.numeric) %>% 
+  mutate(fgpg = fg/games) %>% 
+  mutate(xptpg = xpt/games)
+
+
+# Defense and special teams dataset
+dst_pred <- df_pred[[6]] %>% 
+  mutate(games = 17) %>% 
+  mutate_at(c(2:10), as.numeric)
+  
+```
+
+
+
+
+
+```{r}
+# Setting a seed for reproducibility
+set.seed(100)
+
+# Initial split into training and testing datasets (75% train, 25% test)
+qb_split <- qb_data_min %>% 
+  initial_split(prop = 0.75, strata = year)
+
+qb_train <- training(qb_split)
+qb_test <- testing(qb_split)
+
+lm_spec <- linear_reg() %>% 
+  set_engine(engine = 'lm') %>% 
+  set_mode('regression')
+
+lm_mod <- lm_spec %>% 
+  fit(fantpt ~ comp_pct + ptds + int + yds_per_pass + tds_per_game + tds_per_int + ryds_per_game + y_per_rush + yds_per_pass * tds_per_game + comp_pct * yds_per_pass + comp_pct * tds_per_game, data = qb_train)
+
+glance(lm_mod$fit) %>% knitr::kable()
+
+
+results <- qb_test %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = qb_test)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred)
+
+results %>% slice_head(n = 10)
+
+ggplot(results, aes(y = predicted, x = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  labs(x = "Observed Fantasy Points", y = "Predicted Fantasy Points")
+
+
+# QB Predictions
+qb_predictions <- qb_pred %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = qb_pred)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred) %>% 
+  mutate(avg_fantpt = (fantpt + predicted) / 2) %>% 
+  arrange(desc(avg_fantpt)) %>% 
+  mutate(par = avg_fantpt - lag(avg_fantpt))
+
+qb_predictions %>% slice_head(n=10)
+
+```
+
+
+
+```{r}
+# RB Model
+rb_data_min <- rb_data_min %>% 
+  drop_na(c('fantpt', 'rush_att', 'rush_yds', 'y_per_rush', 'rush_td', 'rec', 'y_per_rec', 'rec_tds', 'fmb', 'tds_per_rush', 'pct_rec', 'pct_caught'))
+
+rb_model <- lm(fantpt ~ rush_att + rush_yds + y_per_rush + rush_td + rec + y_per_rec + rec_tds + fmb + tds_per_rush + pct_rec + rec * y_per_rec, data = rb_data_min)
+summary(rb_model)
+
+# Histogram to check normality of residuals. Looks pretty normal centered around 0 except for a few outliers with residuals greater than 5
+ggplot(rb_data_min, aes(x = rb_model$residuals)) + 
+         geom_histogram() +
+  labs(x = 'Residuals', title = 'Histogram of the residuals of initial model')
+
+# Finding and removing the outliers with residuals greater than 5
+tail(sort(rb_model$residuals), 12)
+rb_data_min2 <- rb_data_min[-c(399, 229,62,344,552,617,3,359,572,154,429,509), ]
+
+
+# Re-fitting model without the 12 outliers
+rb_model2 <- lm(fantpt ~ rush_att + rush_yds + y_per_rush + rush_td + rec + y_per_rec + rec_tds + fmb + tds_per_rush + pct_rec + rec * y_per_rec, data = rb_data_min2)
+summary(rb_model2)
+
+
+# This histogram of the residuals looks much better in terms of normality
+ggplot(rb_data_min2, aes(x = rb_model2$residuals)) + 
+  geom_histogram() +
+  labs(title = 'Histogram of the residuals of model without outliers', x = 'Residuals')
+
+
+# Checking QQ plot
+ggplot(rb_data_min2, aes(sample = rb_model2$residuals)) + 
+  geom_qq() + 
+  geom_qq_line() + 
+  labs(title = 'QQ plot', x = 'Theoretical Normal Quantiles', y = "Sample Quantiles")
+  
+# QQ plot shows heavy in the tails.
+
+# Shapiro test, shows that we should reject the null that residuals are normally distributed
+shapiro.test(rb_model$residuals)
+
+# While the graphs visually looked better, our Shapiro Wilk test still did not indicate normality in the residuals. We will proceed with all of our analysis using the full dataset that includes outliers, but with the background knowledge that our estimations and prediction results are likely biased and inefficient. 
+```
+
+```{r}
+# Setting a seed for reproducibility
+set.seed(100)
+
+# Initial split into training and testing datasets (75% train, 25% test)
+rb_split <- rb_data_min2 %>% 
+  initial_split(prop = 0.75, strata = year)
+
+rb_train <- training(rb_split)
+rb_test <- testing(rb_split)
+
+# Model specification
+lm_spec <- linear_reg() %>% 
+  set_engine(engine = 'lm') %>% 
+  set_mode('regression')
+
+lm_mod <- lm_spec %>% 
+  fit(fantpt ~ rush_att + rush_yds + y_per_rush + rush_td + rec + y_per_rec + rec_tds + fmb + tds_per_rush + pct_rec + rec * y_per_rec, data = rb_data_min2)
+
+glance(lm_mod$fit) %>% knitr::kable()
+
+
+# Test results from model
+results <- rb_test %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = rb_test)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred)
+
+results %>% slice_head(n = 10)
+
+# Graphing observed fantasy point totals vs. predicted fantasy point totals
+ggplot(results, aes(y = predicted, x = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  labs(x = "Observed Fantasy Points", y = "Predicted Fantasy Points")
+
+# RB Predictions
+rb_predictions <- rb_pred %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = rb_pred)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred) %>% 
+  mutate(avg_fantpt = (fantpt + predicted) / 2) %>% 
+  arrange(desc(avg_fantpt)) %>% 
+  mutate(par = avg_fantpt - lag(avg_fantpt))
+
+rb_predictions %>% slice_head(n=10)
+
+
+# WOW! The difference between Christian McCaffrey's projected points and the next best RB's (Breece Hall) is 46.2!!!
+```
+
+
+```{r}
+# WR Model
+wr_data_min <- wr_data %>% 
+  filter(tgt > 30)
+
+wr_model <- lm(fantpt ~ rec + y_per_rec + rec_tds + rectds_per_game + fmb + rush_att + rush_yds + rec * y_per_rec, data = wr_data_min)
+summary(wr_model)
+
+# Histogram of residuals looks pretty normal and centered around 0, with the exception of a few outliers
+ggplot(wr_data_min, aes(x = wr_model$residuals)) + 
+  geom_histogram()
+
+tail(sort(wr_model$residuals), 10)
+head(sort(wr_model$residuals), 2)
+wr_data_min2 <- wr_data_min[-c(297,244,566,87,223,265,407,599,586,348, 40, 201), ]
+
+
+wr_model2 <- lm(fantpt ~ rec + y_per_rec + rec_tds + rectds_per_game + fmb + rush_att + rush_yds + rec * y_per_rec, data = wr_data_min2)
+summary(wr_model2)
+
+ggplot(wr_data_min2, aes(x = wr_model2$residuals)) + 
+  geom_histogram()
+
+ggplot(wr_data_min2, aes(sample = wr_model2$residuals)) + 
+  geom_qq() + 
+  geom_qq_line()
+
+shapiro.test(wr_model2$residuals)
+
+# While the graphs visually looked better, our Shapiro Wilk test still did not indicate normality in the residuals. We will proceed with all of our analysis using the full dataset that includes outliers, but with the background knowledge that our estimations and prediction results are likely biased and inefficient. 
+```
+
+```{r}
+# Setting a seed for reproducibility 
+set.seed(100)
+
+# Initial split into training and testing datasets (75% train, 25% test)
+wr_split <- wr_data_min2 %>% 
+  initial_split(prop = 0.75, strata = year)
+
+wr_train <- training(wr_split)
+wr_test <- testing(wr_split)
+
+# Model specification
+lm_spec <- linear_reg() %>% 
+  set_engine(engine = 'lm') %>% 
+  set_mode('regression')
+
+lm_mod <- lm_spec %>% 
+  fit(fantpt ~ rec + y_per_rec + rec_tds + rectds_per_game + fmb + rush_att + rush_yds + rec * y_per_rec, data = wr_data_min2)
+
+glance(lm_mod$fit) %>% knitr::kable()
+
+# Test results from model
+results <- wr_test %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = wr_test)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred)
+
+results %>% slice_head(n = 10)
+
+ggplot(results, aes(y = predicted, x = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+  labs(x = "Observed Fantasy Points", y = "Predicted Fantasy Points")
+
+
+
+
+wr_predictions <- wr_pred %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = wr_pred)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred) %>% 
+  mutate(avg_fantpt = (fantpt + predicted) / 2) %>% 
+  arrange(desc(avg_fantpt)) %>% 
+  mutate(par = avg_fantpt - lag(avg_fantpt))
+
+wr_predictions %>% slice_head(n=10)
+
+# Interesting...the difference between CeeDee Lamb and Tyreek's predicted points is almost nonexistent, but the dropoff after Tyreek to Ja'Marr Chase is huge! This tells me that if you have the chance to draft CeeDee or Tyreek, you shouldn't wait to take them. 
+```
+
+
+
+```{r}
+# TE Model
+te_data_min <- te_data %>% filter(pos_rank < 30)
+
+te_model <- lm(fantpt ~ rec + rec_yds + y_per_rec + rec_tds + rtds_per_game + rec * y_per_rec, data = te_data_min)
+
+
+# Residual plot showing some skew
+ggplot(te_model, aes(x = .fitted, y = .resid)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype = 'dashed')
+
+ggplot(te_data_min, aes(x = te_model$residuals)) + 
+  geom_histogram() 
+
+# Many of these outliers are from Taysom Hill, an anomaly in football. I removed these rows. 
+tail(sort(te_model$residuals), 10)
+te_data_min2 <- te_data_min[-c(41,152,119,92,61), ]
+
+te_model2 <- lm(fantpt ~ rec + rec_yds + y_per_rec + rec_tds + rtds_per_game + rec * y_per_rec, data = te_data_min2)
+
+ggplot(te_model2, aes(x = .fitted, y = .resid)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype = 'dashed')
+
+# After removing these outliers, the residual plot looks much more random and less skewed
+
+# Histogram of residuals
+ggplot(te_data_min2, aes(x = te_model2$residuals)) + 
+  geom_histogram()
+
+# Shapiro Wilk test
+shapiro.test(te_model2$residuals)
+
+# While these tests for normality 'fail', I want to keep the outliers because the TE position is quite skewed. Historically, there are only a few TE that produce lots of fantasy points (Kelce, Mark Andrews, etc), and the dropoff to the average TE is large. I will proceed knowing results may be unbiased and inefficient due to this. 
+```
+
+```{r}
+# Set seed for reproducibility
+set.seed(100)
+
+# Initial split into training and testing datasets (75% train, 25% test)
+te_split <- te_data_min2 %>% 
+  initial_split(prop = 0.75, strata = year)
+
+te_train <- training(te_split)
+te_test <- testing(te_split)
+
+# Model specification
+lm_spec <- linear_reg() %>% 
+  set_engine(engine = 'lm') %>% 
+  set_mode('regression')
+
+lm_mod <- lm_spec %>% 
+  fit(fantpt ~ rec + rec_yds + y_per_rec + rec_tds + rtds_per_game + rec * y_per_rec, data = te_data_min2)
+
+glance(lm_mod$fit) %>% knitr::kable()
+
+# Test results from model
+results <- te_test %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = te_test)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred)
+
+results %>% slice_head(n = 10)
+
+ggplot(results, aes(y = predicted, x = fantpt, color = as.factor(year))) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE) + 
+
+  
+# TE Predictions
+te_predictions <- te_pred %>% 
+  bind_cols(lm_mod %>% 
+              predict(new_data = te_pred)) %>% 
+  select(c(player, fantpt, .pred)) %>% 
+  rename(predicted = .pred) %>% 
+  mutate(avg_fantpt = (fantpt + predicted) / 2) %>% 
+  arrange(desc(avg_fantpt)) %>% 
+  mutate(par = avg_fantpt - lag(avg_fantpt))
+
+te_predictions %>% slice_head(n=10)
+
+# The dropoff between each tight end is relatively steady, with about a 4-6 point dropoff per...those could add up quick, though, so prioritizing TE is important. 
+```
+
+
+```{r}
+# Exporting to use in Python
+write.csv(qb_predictions,"C:\\users\\Ryan Chang\\downloads\\qb_predictions.csv", row.names = FALSE)
+write.csv(rb_predictions,"C:\\users\\Ryan Chang\\downloads\\rb_predictions.csv", row.names = FALSE)
+write.csv(te_predictions,"C:\\users\\Ryan Chang\\downloads\\te_predictions.csv", row.names = FALSE)
+write.csv(wr_predictions,"C:\\users\\Ryan Chang\\downloads\\wr_predictions.csv", row.names = FALSE)
+```
+
+
