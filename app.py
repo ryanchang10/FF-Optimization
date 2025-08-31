@@ -6,6 +6,7 @@ import re
 def normalize_name(name):
     return re.sub(r'[^a-z]', '', name.lower())  # remove non-letters, lowercase
 
+
 # --- Load Data ---
 @st.cache_data
 def load_data():
@@ -13,12 +14,6 @@ def load_data():
     rb = pd.read_csv("rb_predictions25.csv")
     wr = pd.read_csv("wr_predictions25.csv")
     te = pd.read_csv("te_predictions25.csv")
-    
-    # Shift the 'par' column upward by 1 for each position dataset
-    qb['par'] = qb['par'].shift(-1)
-    rb['par'] = rb['par'].shift(-1)
-    wr['par'] = wr['par'].shift(-1)
-    te['par'] = te['par'].shift(-1)
 
     qb["Position"] = "QB"
     rb["Position"] = "RB"
@@ -27,17 +22,35 @@ def load_data():
 
     df = pd.concat([qb, rb, wr, te], ignore_index=True)
 
-    # Add normalized player name for case- and punctuation-insensitive lookup
+    # Add normalized player name for lookup
     df["player_normalized"] = df["player"].apply(normalize_name)
 
     return df
 
+
+# --- Recalculate PAR dynamically based on available players ---
+def recalculate_par(df):
+    updated = []
+
+    for position in ["QB", "RB", "WR", "TE"]:
+        # Filter and sort players by position and fantasy points
+        pos_df = df[df["Position"] == position].copy()
+        pos_df = pos_df.sort_values(by="avg_fantpt", ascending=False).reset_index(drop=True)
+
+        # Recalculate par as difference from the next best player
+        pos_df["par"] = pos_df["avg_fantpt"] - pos_df["avg_fantpt"].shift(-1)
+
+        updated.append(pos_df)
+
+    return pd.concat(updated, ignore_index=True)
+
+
+# --- Load the full dataset ---
 players_df = load_data()
 
 # --- Track drafted players ---
 if "drafted_normalized" not in st.session_state:
     st.session_state.drafted_normalized = set()
-
 
 # --- Streamlit App UI ---
 st.title("🏈 Fantasy Football Draft Tool")
@@ -59,12 +72,15 @@ if submitted:
         else:
             st.warning(f"No match found for '{player_drafted}'. Please check spelling.")
 
-
-# --- Filter available players ---
+# --- Filter out drafted players ---
 available_players = players_df[
     ~players_df["player_normalized"].isin(st.session_state.drafted_normalized)
 ]
 
+# --- Recalculate PAR values dynamically ---
+available_players = recalculate_par(available_players)
+
+# --- Display Top Pick by Position ---
 st.subheader("🔝 Best Available Pick by Position")
 
 top_picks = []
@@ -85,6 +101,7 @@ else:
     st.write("No available players to show.")
 
 
+# --- Display Top 5 by Position ---
 st.subheader("🎯 Top 5 Available Players by Position")
 
 for position in ["QB", "RB", "WR", "TE"]:
@@ -94,6 +111,4 @@ for position in ["QB", "RB", "WR", "TE"]:
         .sort_values(by="avg_fantpt", ascending=False)
         .head(5)
     )
-    # Display the table with relevant columns
     st.dataframe(top5[["player", "avg_fantpt", "par"]])
-
