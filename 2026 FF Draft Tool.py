@@ -287,7 +287,8 @@ with tab1:
         player_drafted = st.text_input("Enter drafted player name:", key="player_input")
         submitted = st.form_submit_button("Add Pick")
     if submitted and player_drafted:
-        add_pick(player_drafted)
+        if add_pick(player_drafted):
+            st.rerun()
 
 with tab2:
     st.caption("Check off players as they're drafted — handy for logging several other teams' picks at once.")
