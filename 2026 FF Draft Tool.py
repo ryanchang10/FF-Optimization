@@ -217,13 +217,23 @@ with st.sidebar:
     st.write(f"Your draft slot: **{config['draft_slot']}**")
     st.write(f"Picks logged so far: **{st.session_state.pick_count}**")
 
+    st.markdown("### 🎛️ Recommendation Weights")
+    st.caption("How much each factor matters when ranking who to draft next.")
+    w_par = st.slider("Positional drop-off (PAR)", 0, 100, 40)
+    w_pts = st.slider("Projected points (avg_fantpt)", 0, 100, 40)
+    w_diff = st.slider("Projected diff", 0, 100, 20)
+
     if st.button("🔄 Reset Draft"):
         for key in ["league_config", "my_roster", "drafted_normalized", "pick_count", "draft_log"]:
             st.session_state.pop(key, None)
         st.rerun()
 
-# Recommendation weighting: PAR matters most, avg_fantpt as a smaller tiebreaker/boost
-w_par_n, w_pts_n = 0.9, 0.1
+# Normalize weights so they sum to 1 (avoid divide-by-zero if user sets all to 0)
+_weight_sum = w_par + w_pts + w_diff
+if _weight_sum == 0:
+    w_par_n, w_pts_n, w_diff_n = 0.4, 0.4, 0.2
+else:
+    w_par_n, w_pts_n, w_diff_n = w_par / _weight_sum, w_pts / _weight_sum, w_diff / _weight_sum
 
 # --- Whose turn is it? ---
 next_pick_number = st.session_state.pick_count + 1
@@ -274,22 +284,45 @@ def add_pick(player_name_raw, silent=False):
         return False
 
 
-# --- Draft entry: two ways to log a pick to cut down on missed/mistyped picks ---
+# --- Draft entry: three ways to log a pick to cut down on missed/mistyped picks ---
 st.subheader("📝 Log a Pick")
 
 drafted_set_now = st.session_state.drafted_normalized
 available_now = players_df[~players_df["player_normalized"].isin(drafted_set_now)]
 
-tab1, tab2 = st.tabs(["⌨️ Type Name", "📋 Full List"])
+tab1, tab2, tab3 = st.tabs(["🔍 Search & Select", "⌨️ Type Name", "📋 Full List"])
 
 with tab1:
+    st.caption("Pick from the list of undrafted players — this avoids typos entirely.")
+    sorted_avail = available_now.sort_values(by="avg_fantpt", ascending=False)
+    option_labels = [f"{row.player} ({row.Position})" for row in sorted_avail.itertuples()]
+    label_to_name = dict(zip(option_labels, sorted_avail["player"]))
+
+    if option_labels:
+        selected_label = st.selectbox(
+            "Select drafted player",
+            option_labels,
+            index=None,
+            placeholder="Type to search...",
+            key="select_player_input",
+        )
+        if st.button("Add Selected Pick"):
+            if selected_label:
+                add_pick(label_to_name[selected_label])
+                st.rerun()
+            else:
+                st.warning("Please select a player first.")
+    else:
+        st.write("No players remaining.")
+
+with tab2:
     with st.form("draft_form", clear_on_submit=True):
         player_drafted = st.text_input("Enter drafted player name:", key="player_input")
         submitted = st.form_submit_button("Add Pick")
     if submitted and player_drafted:
         add_pick(player_drafted)
 
-with tab2:
+with tab3:
     st.caption("Check off players as they're drafted — handy for logging several other teams' picks at once.")
     fcol1, fcol2 = st.columns([1, 2])
     with fcol1:
@@ -401,7 +434,7 @@ available_players = players_df[
 # recompute a live one that reflects who's actually still on the board.
 available_players = recalculate_par(available_players)
 
-# --- Best value picks: ranks by PAR (90%) and projected points (10%) ---
+# --- Best value picks: factors in position need, PAR, points, and predicted_diff ---
 st.subheader("💎 Best Value Picks for Your Team")
 needed_positions = compute_position_needs(st.session_state.my_roster)
 
@@ -411,29 +444,25 @@ else:
     scored = available_players.copy()
     scored["par_norm"] = normalize_series(scored["par"])
     scored["fantpt_norm"] = normalize_series(scored["avg_fantpt"])
-    scored["score"] = w_par_n * scored["par_norm"] + w_pts_n * scored["fantpt_norm"]
+    scored["diff_norm"] = normalize_series(scored["predicted_diff"])
+    scored["score"] = (
+        w_par_n * scored["par_norm"] + w_pts_n * scored["fantpt_norm"] + w_diff_n * scored["diff_norm"]
+    )
 
-    positions_to_show = needed_positions if needed_positions else {"QB", "RB", "WR", "TE"}
     if not needed_positions:
-        st.write("Your starting lineup and FLEX are full — nice work! Here's the best available at each position anyway.")
+        st.write("Your starting lineup and FLEX are full — nice work! Check the tables below for bench depth.")
+        candidates = scored.sort_values(by="score", ascending=False).head(10)
+    else:
+        candidates = scored[scored["Position"].isin(needed_positions)].sort_values(by="score", ascending=False)
 
-    best_per_position = []
-    for position in ["QB", "RB", "WR", "TE"]:
-        if position not in positions_to_show:
-            continue
-        pos_candidates = scored[scored["Position"] == position]
-        if not pos_candidates.empty:
-            best_per_position.append(pos_candidates.sort_values(by="score", ascending=False).head(1))
-
-    if best_per_position:
-        candidates = pd.concat(best_per_position).sort_values(by="score", ascending=False)
+    if not candidates.empty:
         top_rec = candidates.iloc[0]
         st.write(
             f"🔥 **Top recommendation: {top_rec['player']} ({top_rec['Position']})** — "
-            f"best option among the positions you still need (90% PAR / 10% projected points)."
+            f"best blend of positional drop-off, projected points, and projected diff among the positions you still need."
         )
         st.dataframe(
-            candidates[["Position", "player", "avg_fantpt", "par", "predicted_diff", "score"]],
+            candidates[["Position", "player", "avg_fantpt", "par", "predicted_diff", "score"]].head(10),
             use_container_width=True,
             hide_index=True,
         )
@@ -465,7 +494,19 @@ else:
     st.write("No available players to show.")
 
 
-# --- My Team ---
+# --- Display Top 5 by Position ---
+st.subheader("🎯 Top 5 Available Players by Position")
+
+for position in ["QB", "RB", "WR", "TE"]:
+    st.markdown(f"### {position}")
+    top5 = (
+        available_players[available_players["Position"] == position]
+        .sort_values(by="avg_fantpt", ascending=False)
+        .head(5)
+    )
+    st.dataframe(top5[["player", "avg_fantpt", "par", "predicted_diff"]], use_container_width=True, hide_index=True)
+
+# --- My Team (moved to the bottom so recommendations stay visible while drafting) ---
 st.divider()
 st.subheader("🧑‍💼 My Team")
 roster_rows = [
@@ -490,16 +531,3 @@ sum_col1, sum_col2, sum_col3 = st.columns(3)
 sum_col1.metric("Total Avg FantPt", f"{total_fantpt:.1f}")
 sum_col2.metric("Total PAR", f"{total_par:.1f}")
 sum_col3.metric("Total Projected Diff", f"{total_diff:.1f}")
-
-# --- Display Top 5 by Position ---
-st.subheader("🎯 Top 5 Available Players by Position")
-
-for position in ["QB", "RB", "WR", "TE"]:
-    st.markdown(f"### {position}")
-    top5 = (
-        available_players[available_players["Position"] == position]
-        .sort_values(by="avg_fantpt", ascending=False)
-        .head(5)
-    )
-    st.dataframe(top5[["player", "avg_fantpt", "par", "predicted_diff"]], use_container_width=True, hide_index=True)
-
