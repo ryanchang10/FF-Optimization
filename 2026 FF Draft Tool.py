@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import difflib
 import re
 
 # --- Helper function to normalize names ---
@@ -22,13 +23,19 @@ def load_data():
 
     df = pd.concat([qb, rb, wr, te], ignore_index=True)
 
+    # If predicted_diff isn't in the source CSVs, default to 0 so the app
+    # doesn't crash. If your CSVs use a different column name for this,
+    # rename it here.
+    if "predicted_diff" not in df.columns:
+        df["predicted_diff"] = 0.0
+
     # Add normalized player name for lookup
     df["player_normalized"] = df["player"].apply(normalize_name)
 
     return df
 
 
-# --- Recalculate PAR (drop-off to next best player) dynamically ---
+# --- Recalculate PAR (drop-off to next best player) for a given player pool ---
 def recalculate_par(df):
     updated = []
 
@@ -39,6 +46,14 @@ def recalculate_par(df):
         updated.append(pos_df)
 
     return pd.concat(updated, ignore_index=True)
+
+
+# --- Min-max normalize a series to 0-1 so different metrics can be combined fairly ---
+def normalize_series(s):
+    s = s.fillna(0)
+    if s.max() == s.min():
+        return pd.Series([0.5] * len(s), index=s.index)
+    return (s - s.min()) / (s.max() - s.min())
 
 
 # --- Build empty roster slot list from league config ---
@@ -54,6 +69,8 @@ def build_roster_slots(config):
                 "player": None,
                 "position": None,
                 "avg_fantpt": None,
+                "par": None,
+                "predicted_diff": None,
             })
 
     add_slots("QB", config["QB"])
@@ -77,13 +94,15 @@ def team_on_the_clock(pick_number, num_teams):
 
 
 # --- Fill the first open roster slot matching a drafted player's position ---
-def fill_roster_slot(roster, position, player_name, avg_fantpt):
+def fill_roster_slot(roster, position, player_name, avg_fantpt, par, predicted_diff):
     def try_fill(slot_type):
         for slot in roster:
             if slot["slot_type"] == slot_type and slot["player"] is None:
                 slot["player"] = player_name
                 slot["position"] = position
                 slot["avg_fantpt"] = avg_fantpt
+                slot["par"] = par
+                slot["predicted_diff"] = predicted_diff
                 return True
         return False
 
@@ -93,6 +112,7 @@ def fill_roster_slot(roster, position, player_name, avg_fantpt):
     if position in ("RB", "WR", "TE"):
         return try_fill(position) or try_fill("FLEX") or try_fill("BENCH")
 
+    # Anything else (D/ST, K, etc.) just goes to BENCH if there's room
     return try_fill("BENCH")
 
 
@@ -108,7 +128,14 @@ def rebuild_state():
     for idx, entry in enumerate(log):
         pick_number = idx + 1
         if team_on_the_clock(pick_number, config["num_teams"]) == config["draft_slot"]:
-            fill_roster_slot(roster, entry["position"], entry["player"], entry["avg_fantpt"])
+            fill_roster_slot(
+                roster,
+                entry["position"],
+                entry["player"],
+                entry["avg_fantpt"],
+                entry.get("par"),
+                entry.get("predicted_diff"),
+            )
 
     st.session_state.my_roster = roster
 
@@ -131,9 +158,14 @@ def compute_position_needs(roster):
     return needed
 
 
-# --- Load the full dataset ---
+# --- Load the full dataset, with a static PAR computed once against the full field ---
+# This "master" PAR/predicted_diff is what gets stored with each pick and shown on
+# your roster - it reflects a player's value at the time you drafted them relative
+# to the whole player pool, and won't shift around as other players get drafted.
 players_df = load_data()
+players_df = recalculate_par(players_df)
 
+st.set_page_config(layout="wide")
 st.title("🏈 Fantasy Football Draft Tool")
 
 # --- One-time league setup ---
@@ -178,16 +210,30 @@ if "league_config" not in st.session_state:
 
 config = st.session_state.league_config
 
-# --- Sidebar: league info + reset ---
+# --- Sidebar: league info, recommendation weights, and reset ---
 with st.sidebar:
     st.markdown("### League Setup")
     st.write(f"Teams: **{config['num_teams']}**")
     st.write(f"Your draft slot: **{config['draft_slot']}**")
     st.write(f"Picks logged so far: **{st.session_state.pick_count}**")
+
+    st.markdown("### 🎛️ Recommendation Weights")
+    st.caption("How much each factor matters when ranking who to draft next.")
+    w_par = st.slider("Positional drop-off (PAR)", 0, 100, 40)
+    w_pts = st.slider("Projected points (avg_fantpt)", 0, 100, 40)
+    w_diff = st.slider("Projected diff", 0, 100, 20)
+
     if st.button("🔄 Reset Draft"):
         for key in ["league_config", "my_roster", "drafted_normalized", "pick_count", "draft_log"]:
             st.session_state.pop(key, None)
         st.rerun()
+
+# Normalize weights so they sum to 1 (avoid divide-by-zero if user sets all to 0)
+_weight_sum = w_par + w_pts + w_diff
+if _weight_sum == 0:
+    w_par_n, w_pts_n, w_diff_n = 0.4, 0.4, 0.2
+else:
+    w_par_n, w_pts_n, w_diff_n = w_par / _weight_sum, w_pts / _weight_sum, w_diff / _weight_sum
 
 # --- Whose turn is it? ---
 next_pick_number = st.session_state.pick_count + 1
@@ -199,34 +245,150 @@ if is_my_turn:
 else:
     st.write(f"Pick #{next_pick_number} — Team {on_the_clock} on the clock")
 
-# --- Input form with Enter key support and auto-clear ---
-with st.form("draft_form", clear_on_submit=True):
-    player_drafted = st.text_input(
-        "Enter drafted player name:",
-        key="player_input"
-    )
-    submitted = st.form_submit_button("Add Pick")
 
-if submitted and player_drafted:
-    normalized_input = normalize_name(player_drafted)
+# --- Shared pick-adding logic used by every entry method below ---
+def add_pick(player_name_raw, silent=False):
+    normalized_input = normalize_name(player_name_raw)
 
     if normalized_input in st.session_state.drafted_normalized:
-        st.warning(f"{player_drafted} has already been marked as drafted.")
-    elif normalized_input in players_df["player_normalized"].values:
+        if not silent:
+            st.warning(f"{player_name_raw} has already been marked as drafted.")
+        return False
+
+    if normalized_input in players_df["player_normalized"].values:
         match = players_df[players_df["player_normalized"] == normalized_input].iloc[0]
         entry = {
             "player": match["player"],
             "position": match["Position"],
             "avg_fantpt": match["avg_fantpt"],
+            "predicted_diff": match["predicted_diff"],
+            "par": match["par"],
             "normalized": normalized_input,
         }
         st.session_state.draft_log.append(entry)
         rebuild_state()
         pick_num = len(st.session_state.draft_log)
         landed_on_team = " — added to your roster!" if team_on_the_clock(pick_num, config["num_teams"]) == config["draft_slot"] else ""
-        st.success(f"Pick #{pick_num}: {match['player']} ({match['Position']}){landed_on_team}")
+        if not silent:
+            st.success(f"Pick #{pick_num}: {match['player']} ({match['Position']}){landed_on_team}")
+        return True
     else:
-        st.warning(f"No match found for '{player_drafted}'. Please check spelling.")
+        if not silent:
+            st.warning(f"No exact match found for '{player_name_raw}'.")
+            close = difflib.get_close_matches(
+                normalized_input, players_df["player_normalized"].tolist(), n=5, cutoff=0.6
+            )
+            if close:
+                suggestions = players_df[players_df["player_normalized"].isin(close)]["player"].tolist()
+                st.info("Did you mean: " + ", ".join(suggestions) + "?")
+        return False
+
+
+# --- Draft entry: three ways to log a pick to cut down on missed/mistyped picks ---
+st.subheader("📝 Log a Pick")
+
+drafted_set_now = st.session_state.drafted_normalized
+available_now = players_df[~players_df["player_normalized"].isin(drafted_set_now)]
+
+tab1, tab2, tab3 = st.tabs(["🔍 Search & Select", "⌨️ Type Name", "📋 Full List"])
+
+with tab1:
+    st.caption("Pick from the list of undrafted players — this avoids typos entirely.")
+    sorted_avail = available_now.sort_values(by="avg_fantpt", ascending=False)
+    option_labels = [f"{row.player} ({row.Position})" for row in sorted_avail.itertuples()]
+    label_to_name = dict(zip(option_labels, sorted_avail["player"]))
+
+    if option_labels:
+        selected_label = st.selectbox(
+            "Select drafted player",
+            option_labels,
+            index=None,
+            placeholder="Type to search...",
+            key="select_player_input",
+        )
+        if st.button("Add Selected Pick"):
+            if selected_label:
+                add_pick(label_to_name[selected_label])
+                st.rerun()
+            else:
+                st.warning("Please select a player first.")
+    else:
+        st.write("No players remaining.")
+
+with tab2:
+    with st.form("draft_form", clear_on_submit=True):
+        player_drafted = st.text_input("Enter drafted player name:", key="player_input")
+        submitted = st.form_submit_button("Add Pick")
+    if submitted and player_drafted:
+        add_pick(player_drafted)
+
+with tab3:
+    st.caption("Check off players as they're drafted — handy for logging several other teams' picks at once.")
+    fcol1, fcol2 = st.columns([1, 2])
+    with fcol1:
+        pos_filter = st.selectbox("Position", ["All", "QB", "RB", "WR", "TE"], key="full_list_pos_filter")
+    with fcol2:
+        search_filter = st.text_input("Search player name", key="full_list_search")
+
+    list_df = available_now.copy()
+    if pos_filter != "All":
+        list_df = list_df[list_df["Position"] == pos_filter]
+    if search_filter:
+        list_df = list_df[list_df["player"].str.contains(search_filter, case=False, na=False)]
+
+    list_df = list_df.sort_values(by="avg_fantpt", ascending=False)
+    list_df = list_df[["player", "Position", "avg_fantpt", "par", "predicted_diff"]].copy()
+    list_df.insert(0, "Drafted", False)
+
+    edited_df = st.data_editor(
+        list_df,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["player", "Position", "avg_fantpt", "par", "predicted_diff"],
+        key="full_list_editor",
+    )
+
+    if st.button("Add Checked Players to Draft"):
+        checked = edited_df[edited_df["Drafted"] == True]
+        if checked.empty:
+            st.warning("No players checked.")
+        else:
+            added = 0
+            for _, row in checked.iterrows():
+                if add_pick(row["player"], silent=True):
+                    added += 1
+            st.success(f"Added {added} pick(s).")
+            st.rerun()
+
+# --- Log a D/ST or K pick (not in the ranked player pool, but still consumes a pick) ---
+st.subheader("🛡️ Log a D/ST or K Pick")
+st.caption(
+    "D/ST and Kickers aren't in the ranked player data, so use this to keep pick tracking "
+    "and roster assignment accurate when one gets drafted."
+)
+with st.form("dst_k_form", clear_on_submit=True):
+    dk_col1, dk_col2 = st.columns([3, 1])
+    dst_k_name = dk_col1.text_input("Team/Player name (optional)", placeholder="e.g. 49ers D/ST or Justin Tucker")
+    dst_k_type = dk_col2.radio("Type", ["D/ST", "K"], horizontal=True)
+    dst_k_submit = st.form_submit_button("Log Pick")
+
+if dst_k_submit:
+    label = dst_k_name.strip() if dst_k_name.strip() else f"Unnamed {dst_k_type}"
+    normalized = "dstk_" + normalize_name(label) + "_" + dst_k_type.lower().replace("/", "")
+    entry = {
+        "player": label,
+        "position": dst_k_type,
+        "avg_fantpt": 0.0,
+        "predicted_diff": 0.0,
+        "par": None,
+        "normalized": normalized,
+    }
+    st.session_state.draft_log.append(entry)
+    rebuild_state()
+    pick_num = len(st.session_state.draft_log)
+    landed_on_team = " — added to your roster!" if team_on_the_clock(pick_num, config["num_teams"]) == config["draft_slot"] else ""
+    st.success(f"Pick #{pick_num}: {label} ({dst_k_type}){landed_on_team}")
+    st.rerun()
 
 # --- Undo / remove picks ---
 st.subheader("↩️ Undo / Remove a Pick")
@@ -252,57 +414,58 @@ with col_b:
 if log:
     with st.expander("📜 Full Draft Log"):
         log_df = pd.DataFrame([
-            {"Pick #": i + 1, "Player": e["player"], "Position": e["position"], "Avg FantPt": e["avg_fantpt"]}
+            {
+                "Pick #": i + 1,
+                "Player": e["player"],
+                "Position": e["position"],
+                "Avg FantPt": e["avg_fantpt"],
+                "Projected Diff": e.get("predicted_diff"),
+            }
             for i, e in enumerate(log)
         ])
         st.dataframe(log_df, use_container_width=True, hide_index=True)
 
-# --- Filter out drafted players ---
+# --- Filter out drafted players, then recalculate live PAR for the current board ---
 available_players = players_df[
     ~players_df["player_normalized"].isin(st.session_state.drafted_normalized)
-]
+].drop(columns=["par"])
 
-# --- Recalculate PAR values dynamically ---
+# players_df already has "predicted_diff"; drop the stale static "par" above and
+# recompute a live one that reflects who's actually still on the board.
 available_players = recalculate_par(available_players)
 
-# --- Display My Team ---
-st.subheader("🧑‍💼 My Team")
-roster_rows = [
-    {
-        "Slot": slot["label"],
-        "Player": slot["player"] if slot["player"] else "—",
-        "Position": slot["position"] if slot["position"] else "",
-        "Avg FantPt": slot["avg_fantpt"] if slot["avg_fantpt"] is not None else "",
-    }
-    for slot in st.session_state.my_roster
-]
-st.dataframe(pd.DataFrame(roster_rows), use_container_width=True, hide_index=True)
-
-# --- Best value picks based on your team's needs ---
+# --- Best value picks: factors in position need, PAR, points, and predicted_diff ---
 st.subheader("💎 Best Value Picks for Your Team")
 needed_positions = compute_position_needs(st.session_state.my_roster)
 
-if not needed_positions:
-    st.write("Your starting lineup and FLEX are full — nice work! Check the tables below for bench depth.")
+if available_players.empty:
+    st.write("No available players found.")
 else:
-    need_candidates = []
-    for position in needed_positions:
-        top_at_pos = (
-            available_players[available_players["Position"] == position]
-            .sort_values(by="avg_fantpt", ascending=False)
-            .head(1)
-        )
-        if not top_at_pos.empty:
-            need_candidates.append(top_at_pos)
+    scored = available_players.copy()
+    scored["par_norm"] = normalize_series(scored["par"])
+    scored["fantpt_norm"] = normalize_series(scored["avg_fantpt"])
+    scored["diff_norm"] = normalize_series(scored["predicted_diff"])
+    scored["score"] = (
+        w_par_n * scored["par_norm"] + w_pts_n * scored["fantpt_norm"] + w_diff_n * scored["diff_norm"]
+    )
 
-    if need_candidates:
-        need_df = pd.concat(need_candidates).sort_values(by="par", ascending=False)
-        top_rec = need_df.iloc[0]
+    if not needed_positions:
+        st.write("Your starting lineup and FLEX are full — nice work! Check the tables below for bench depth.")
+        candidates = scored.sort_values(by="score", ascending=False).head(10)
+    else:
+        candidates = scored[scored["Position"].isin(needed_positions)].sort_values(by="score", ascending=False)
+
+    if not candidates.empty:
+        top_rec = candidates.iloc[0]
         st.write(
             f"🔥 **Top recommendation: {top_rec['player']} ({top_rec['Position']})** — "
-            f"biggest drop-off before the next best option at a position you still need."
+            f"best blend of positional drop-off, projected points, and projected diff among the positions you still need."
         )
-        st.dataframe(need_df[["Position", "player", "avg_fantpt", "par", "predicted_diff"]], use_container_width=True, hide_index=True)
+        st.dataframe(
+            candidates[["Position", "player", "avg_fantpt", "par", "predicted_diff", "score"]].head(10),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.write("No available players found at the positions you still need.")
 
@@ -322,7 +485,11 @@ for position in ["QB", "RB", "WR", "TE"]:
 
 if top_picks:
     top_picks_df = pd.concat(top_picks)
-    st.dataframe(top_picks_df[["Position", "player", "avg_fantpt", "par", "predicted_diff"]])
+    st.dataframe(
+        top_picks_df[["Position", "player", "avg_fantpt", "par", "predicted_diff"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 else:
     st.write("No available players to show.")
 
@@ -337,4 +504,30 @@ for position in ["QB", "RB", "WR", "TE"]:
         .sort_values(by="avg_fantpt", ascending=False)
         .head(5)
     )
-    st.dataframe(top5[["player", "avg_fantpt", "par", "predicted_diff"]])
+    st.dataframe(top5[["player", "avg_fantpt", "par", "predicted_diff"]], use_container_width=True, hide_index=True)
+
+# --- My Team (moved to the bottom so recommendations stay visible while drafting) ---
+st.divider()
+st.subheader("🧑‍💼 My Team")
+roster_rows = [
+    {
+        "Slot": slot["label"],
+        "Player": slot["player"] if slot["player"] else "—",
+        "Position": slot["position"] if slot["position"] else "",
+        "Avg FantPt": slot["avg_fantpt"] if slot["avg_fantpt"] is not None else "",
+        "PAR": slot["par"] if slot["par"] is not None else "",
+        "Projected Diff": slot["predicted_diff"] if slot["predicted_diff"] is not None else "",
+    }
+    for slot in st.session_state.my_roster
+]
+st.dataframe(pd.DataFrame(roster_rows), use_container_width=True, hide_index=True)
+
+filled_slots = [s for s in st.session_state.my_roster if s["player"] is not None]
+total_fantpt = sum(s["avg_fantpt"] for s in filled_slots if s["avg_fantpt"] is not None)
+total_par = sum(s["par"] for s in filled_slots if s["par"] is not None)
+total_diff = sum(s["predicted_diff"] for s in filled_slots if s["predicted_diff"] is not None)
+
+sum_col1, sum_col2, sum_col3 = st.columns(3)
+sum_col1.metric("Total Avg FantPt", f"{total_fantpt:.1f}")
+sum_col2.metric("Total PAR", f"{total_par:.1f}")
+sum_col3.metric("Total Projected Diff", f"{total_diff:.1f}")
