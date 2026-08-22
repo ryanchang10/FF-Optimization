@@ -423,7 +423,10 @@ else:
             continue
         pos_candidates = scored[scored["Position"] == position]
         if not pos_candidates.empty:
-            best_per_position.append(pos_candidates.sort_values(by="score", ascending=False).head(1))
+            # Take the top player by projected points first, so we always
+            # recommend the actual best available player at a position -
+            # PAR is then only used to compare across positions.
+            best_per_position.append(pos_candidates.sort_values(by="avg_fantpt", ascending=False).head(1))
 
     if best_per_position:
         candidates = pd.concat(best_per_position).sort_values(by="score", ascending=False)
