@@ -222,8 +222,8 @@ with st.sidebar:
             st.session_state.pop(key, None)
         st.rerun()
 
-# Recommendation weighting: PAR matters most, avg_fantpt as a smaller tiebreaker/boost
-w_par_n, w_pts_n = 0.9, 0.1
+# Recommendation weighting: rank position-leaders purely by PAR
+w_par_n, w_pts_n = 1.0, 0.0
 
 # --- Whose turn is it? ---
 next_pick_number = st.session_state.pick_count + 1
